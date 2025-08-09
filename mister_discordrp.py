@@ -99,6 +99,8 @@ def _normalize_key(name: str) -> str:
 # --- Cache (TSV) ---
 # Expect header: key    system    filename    raw_url    blob_url    abs_path
 CACHE = []  # tuples: (system, filename, raw_url, blob_url, key)
+_SYSTEMS_FROM_CACHE = set()
+_SYSTEM_ALIAS_MAP = None  # lazy-built map from pretty -> canonical
 
 def _load_boxart_cache():
     global CACHE
@@ -120,6 +122,7 @@ def _load_boxart_cache():
                 continue
             key, system_folder, fn, raw_url, blob_url = parts[:5]
             CACHE.append((system_folder, fn, raw_url, blob_url, key))
+            _SYSTEMS_FROM_CACHE.add(system_folder)
     print(f"Loaded {len(CACHE):,} box art entries from cache.", flush=True)
 
 def _canon_system(hint: str):
@@ -127,17 +130,123 @@ def _canon_system(hint: str):
         return None
     return SYSTEM_MAP.get(hint, hint)
 
+CONFIDENCE_MIN_SCOPED = 80   # require this score if we have a system match
+CONFIDENCE_MIN_UNSCOPED = 90 # stricter if we had to search globally
+PRETTY_SYSTEMS = [
+    "Adventure Vision","Arcadia 2001","Atari 2600","Atari 5200","Atari 7800","Atari Lynx",
+    "Bally Astrocade","Casio PV-1000","Channel F","ColecoVision","Famicom Disk System",
+    "Gamate","Game & Watch","Game Boy","Game Gear","Gameboy (2 Player)","Gameboy Advance",
+    "Gameboy Advance (2 Player)","Gameboy Color","Genesis +","Genesis 32X","Intellivision",
+    "Magnavox Odyssey2","Master System","Mega Duck","Neo Geo CD","Neo Geo MVS/AES","NES",
+    "Nintendo 64","Sony PlayStation","Pocket Challenge 2","Pokemon Mini","Saturn","Sega CD",
+    "SG-1000","Super Gameboy","Super NES","SuperGrafx","SuperVision","TurboGrafx-16",
+    "TurboGrafx-16 CD","VC 4000","Vectrex","VTech CreatiVision","WonderSwan",
+    "WonderSwan Color","Amiga","Amstrad CPC","Amstrad PCW","Apogee BK-01","Apple I",
+    "Apple IIe","Atari 800XL","Atom","BBC Micro/Master","BK0011M","Casio PV-2000",
+    "Commodore 16","Commodore 64","Commodore PET 2001","Commodore VIC-20","EDSAC",
+    "Electron","Galaksija","Interact","Jupiter Ace","Laser 350/500/700","Lynx 48/96K","M5",
+    "Macintosh Plus","Mattel Aquarius","MSX (1chipMSX)","MultiComp","Orao","Oric",
+    "PC (486SX)","PC/XT","PDP-1","PMD 85-2A","RX-78 Gundam","SAM Coupe","Sinclair QL",
+    "Specialist/MX","SV-328","Tandy MC-10","Tatung Einstein","TI-99/4A","TRS-80",
+    "TRS-80 CoCo 2","TS-1500","TS-Config","Tutor","UK101","Vector-06C","X68000",
+    "ZX Spectrum","ZX Spectrum Next","Arduboy","CHIP-8"
+]
+
+def _tok(s: str):
+    return re.findall(r"[a-z0-9]+", (s or "").lower())
+
+def _sys_match_score(pretty: str, canon: str) -> float:
+    a, b = " ".join(_tok(pretty)), " ".join(_tok(canon))
+    r = SequenceMatcher(None, a, b).ratio()
+    ta, tb = set(_tok(pretty)), set(_tok(canon))
+    overlap = len(ta & tb)
+    return r + min(0.10 * overlap, 0.30)  # small bonus for token overlap
+
+def _best_system_from_cache(name: str):
+    if not _SYSTEMS_FROM_CACHE:
+        return None
+    scored = [(_sys_match_score(name, s), s) for s in _SYSTEMS_FROM_CACHE]
+    scored.sort(reverse=True)
+    score, best = scored[0]
+    return (score, best)
+
+def _build_system_aliases():
+    # Build once, after cache is loaded
+    global _SYSTEM_ALIAS_MAP
+    if _SYSTEM_ALIAS_MAP is not None:
+        return
+    _SYSTEM_ALIAS_MAP = {}
+    for pretty in PRETTY_SYSTEMS:
+        got = _best_system_from_cache(pretty)
+        if not got:
+            continue
+        score, canon = got
+        # Require a decent match so we don't create bad aliases
+        if score >= 0.75:
+            _SYSTEM_ALIAS_MAP[pretty] = canon
+    # Add a few common extra aliases that aren't in PRETTY_SYSTEMS
+    extras = {
+        "PSX": "Sony PlayStation",
+        "PS1": "Sony PlayStation",
+        "SNES": "Super NES",
+        "SFC": "Super NES",
+        "FDS": "Famicom Disk System",
+        "N64": "Nintendo 64",
+        "SGB": "Super Gameboy",
+        "Genesis": "Genesis +",
+        "Mega Drive": "Genesis +",
+        "32X": "Genesis 32X",
+        "PCE": "TurboGrafx-16",
+        "PCE-CD": "TurboGrafx-16 CD",
+        "TG-16": "TurboGrafx-16",
+        "TG-CD": "TurboGrafx-16 CD",
+    }
+    for k, v in extras.items():
+        if v in _SYSTEM_ALIAS_MAP:
+            _SYSTEM_ALIAS_MAP[k] = _SYSTEM_ALIAS_MAP[v]
+
+def _canon_system(hint: str):
+    if not hint:
+        return None
+    _build_boxart_ready = bool(CACHE) and bool(_SYSTEMS_FROM_CACHE)
+    if not _build_boxart_ready:
+        _load_boxart_cache()
+    _build_system_aliases()
+
+    # direct alias first
+    if hint in _SYSTEM_ALIAS_MAP:
+        return _SYSTEM_ALIAS_MAP[hint]
+
+    # exact case-insensitive match to cache systems
+    low = hint.lower()
+    for s in _SYSTEMS_FROM_CACHE:
+        if s.lower() == low:
+            return s
+
+    # fuzzy to cache systems (log if weak)
+    got = _best_system_from_cache(hint)
+    if got and got[0] >= 0.80:
+        return got[1]
+
+    print(f"System hint '{hint}' not confidently recognized; not scoping.", flush=True)
+    return None
+
 def _stem(name: str) -> str:
     return os.path.splitext(name)[0]
 
 def _paren_tokens(stem: str):
-    toks = [t.strip().lower() for t in re.findall(r"\((.*?)\)", stem)]
-    return toks
+    return [t.strip().lower() for t in re.findall(r"\((.*?)\)", stem)]
 
 def _region_tokens_from_title(title: str):
     return set(t for t in _paren_tokens(title) if any(r in t for r in REGION_WORDS))
 
-def _score_candidate(stem: str, key: str, target_key: str, region_hint: set, target_stem_len: int) -> int:
+def _base_tokens(title: str):
+    # non-parenthetical, longish tokens (helps kill "Anniversary Edition" false matches)
+    base = re.sub(r"\s*\([^)]*\)", "", title or "")
+    toks = re.findall(r"[A-Za-z0-9]+", base.lower())
+    return [t for t in toks if len(t) >= 4]
+
+def _score_candidate(stem: str, key: str, target_key: str, region_hint: set, target_stem_len: int, base_tokens) -> int:
     if key == target_key:
         base = 100
     elif key.startswith(target_key) or target_key.startswith(key):
@@ -162,7 +271,10 @@ def _score_candidate(stem: str, key: str, target_key: str, region_hint: set, tar
     if non_region_extras:
         base -= 3 * len(non_region_extras)
 
-    # prefer shorter candidates close to the requested title length
+    # must share at least one strong base token; otherwise heavily penalize
+    if base_tokens and not any(t in key for t in base_tokens):
+        base -= 40
+
     base -= min(5, max(0, (len(stem) - target_stem_len) // 10))
     return base
 
@@ -175,8 +287,10 @@ def find_boxart_and_url(system_hint: str, game_name: str):
     region_hint = _region_tokens_from_title(game_name)
     sys_hint = _canon_system(system_hint)
     target_stem_len = len(_stem(game_name))
+    base_tokens = _base_tokens(game_name)
 
     candidates = CACHE
+    scoped = []
     if sys_hint:
         scoped = [t for t in CACHE if t[0] == sys_hint]
         if scoped:
@@ -190,17 +304,25 @@ def find_boxart_and_url(system_hint: str, game_name: str):
 
     scored = []
     for sys_folder, fn, raw_url, blob_url, key in candidates:
-        score = _score_candidate(_stem(fn), key, target_key, region_hint, target_stem_len)
-        scored.append((score, len(fn), sys_folder, fn, raw_url, blob_url))
+        score = _score_candidate(_stem(fn), key, target_key, region_hint, target_stem_len, base_tokens)
+        scored.append((score, len(fn), sys_folder, fn, raw_url, blob_url, key))
 
     if not scored:
         print(f"No boxart in cache for '{game_name}'", flush=True)
         return None, None
 
     scored.sort(reverse=True)
-    top = scored[0]
-    print(f"Boxart match (scored {top[0]}): [{top[2]}] {top[3]}", flush=True)
-    return top[4], top[5]
+    top_score, _, top_sys, top_fn, top_raw, top_blob, _ = scored[0]
+    min_needed = CONFIDENCE_MIN_SCOPED if scoped else CONFIDENCE_MIN_UNSCOPED
+    if top_score < min_needed:
+        print(f"Low-confidence match (score {top_score} < {min_needed}); skipping image.", flush=True)
+        return None, None
+    if sys_hint and top_sys != sys_hint:
+        print(f"Top match is from different system [{top_sys}] than hint [{sys_hint}]; skipping image.", flush=True)
+        return None, None
+
+    print(f"Boxart match (scored {top_score}): [{top_sys}] {top_fn}", flush=True)
+    return top_raw, top_blob
 
 def is_valid_image(url: str) -> bool:
     try:
@@ -298,7 +420,11 @@ def set_presence(data, start_time, last_game):
 def main():
     host = sys.argv[1] if len(sys.argv) > 1 else mister_host
     port = sys.argv[2] if len(sys.argv) > 2 else mister_port
-    RPC.connect()
+    try:
+        RPC.connect()
+    except KeyboardInterrupt:
+        print("Cancelled before connecting. Goodbye!", flush=True)
+        return
     print(f"Connected to Discord RPC (Client ID: {client_id})", flush=True)
 
     start_time = datetime.now()
@@ -310,9 +436,11 @@ def main():
             time.sleep(15)
     except KeyboardInterrupt:
         print("Disconnecting from Discord...", flush=True)
-        RPC.clear()
-        RPC.close()
-        print("Disconnected. Goodbye!", flush=True)
+        try:
+            RPC.clear()
+            RPC.close()
+        finally:
+            print("Disconnected. Goodbye!", flush=True)
 
 if __name__ == "__main__":
     main()
